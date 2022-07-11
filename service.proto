@@ -7,6 +7,8 @@ syntax = "proto3";
 // полученный код при загрузки в автогрейдер надо будет положить в service.go
 // на время тестов можно ничего не делать
 
+option go_package = ".;main";
+
 package main;
 
 message Event {
