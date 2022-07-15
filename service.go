@@ -25,7 +25,7 @@ func StartMyMicroservice(address string) {
 
    server := grpc.NewServer()
 
-   // server.RegisterService(&Admin_ServiceDesc, server)
+   RegisterAdminServer(server, NewAdminService())
    RegisterBizServer(server, NewBizService())
    fmt.Println("starting server at :" + address)
    server.Serve(listener)
@@ -33,6 +33,22 @@ func StartMyMicroservice(address string) {
 
 type Admin struct {
 }
+
+func NewAdminService() AdminServer {
+   return &Admin{}
+}
+
+func (admin Admin) Logging(in *Nothing, logServer Admin_LoggingServer) error {
+   log.Default().Println("Logging")
+   return nil
+}
+
+func (admin Admin) Statistics(stat *StatInterval, statServer Admin_StatisticsServer) error {
+   log.Default().Println("Statistics")
+   return nil
+}
+
+func (admin Admin) mustEmbedUnimplementedAdminServer() {}
 
 type Biz struct {
 }
