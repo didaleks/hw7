@@ -2,7 +2,7 @@ package main
 
 import (
    "context"
-   "fmt"
+   "encoding/json"
    "log"
    "net"
 
@@ -11,24 +11,41 @@ import (
 
 // тут вы пишете код
 // обращаю ваше внимание - в этом задании запрещены глобальные переменные
-func main() {
-   // запуск сервиса
-   address := "127.0.0.1:8082"
-   StartMyMicroservice(address)
-}
+// func main() {
+//    // запуск сервиса
+//    address := "127.0.0.1:8082"
+//    ctx := context.Background()
+//    StartMyMicroservice(ctx, address, "")
+//    fmt.Scanln()
+// }
 
-func StartMyMicroservice(address string) {
+func StartMyMicroservice(ctx context.Context, address string, aclDataJson string) error {
+   var aclDataMap map[string]interface{}
+   err := json.Unmarshal([]byte(aclDataJson), &aclDataMap)
+   if err != nil {
+      return err
+   }
+
    listener, err := net.Listen("tcp", address)
    if err != nil {
       log.Fatalln("can't listen port", err)
+      return err
    }
 
    server := grpc.NewServer()
-
    RegisterAdminServer(server, NewAdminService())
    RegisterBizServer(server, NewBizService())
-   fmt.Println("starting server at :" + address)
-   server.Serve(listener)
+   go func() {
+      server.Serve(listener)
+   }()
+   go func(ctx context.Context, server *grpc.Server) {
+      select {
+      case <-ctx.Done():
+         server.Stop()
+      }
+   }(ctx, server)
+
+   return err
 }
 
 type Admin struct {
