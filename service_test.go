@@ -254,17 +254,18 @@ func TestLogging(t *testing.T) {
 
 	wg.Wait()
 
-	expectedLogData1 := []*Event{
-		{0, "logger", "/main.Admin/Logging", ""},
-		{0, "biz_user", "/main.Biz/Check", ""},
-		{0, "biz_admin", "/main.Biz/Check", ""},
-		{0, "biz_admin", "/main.Biz/Test", ""},
-	}
-	expectedLogData2 := []*Event{
-		{0, "biz_user", "/main.Biz/Check", ""},
-		{0, "biz_admin", "/main.Biz/Check", ""},
-		{0, "biz_admin", "/main.Biz/Test", ""},
-	}
+   expectedLogData1 := []*Event{
+      {Timestamp: 0, Consumer: "logger", Method: "/main.Admin/Logging", Host: ""},
+      {Timestamp: 0, Consumer: "biz_user", Method: "/main.Biz/Check", Host: ""},
+      {Timestamp: 0, Consumer: "biz_admin", Method: "/main.Biz/Check", Host: ""},
+      {Timestamp: 0, Consumer: "biz_admin", Method: "/main.Biz/Test", Host: ""},
+   }
+
+   expectedLogData2 := []*Event{
+      {Timestamp: 0, Consumer: "biz_user", Method: "/main.Biz/Check", Host: ""},
+      {Timestamp: 0, Consumer: "biz_admin", Method: "/main.Biz/Check", Host: ""},
+      {Timestamp: 0, Consumer: "biz_admin", Method: "/main.Biz/Test", Host: ""},
+   }
 
 	if !reflect.DeepEqual(logData1, expectedLogData1) {
 		t.Fatalf("logs1 dont match\nhave %+v\nwant %+v", logData1, expectedLogData1)
@@ -292,9 +293,9 @@ func TestStat(t *testing.T) {
 	biz := NewBizClient(conn)
 	adm := NewAdminClient(conn)
 
-	statStream1, err := adm.Statistics(getConsumerCtx("stat"), &StatInterval{2})
-	wait(1)
-	statStream2, err := adm.Statistics(getConsumerCtx("stat"), &StatInterval{3})
+   statStream1, err := adm.Statistics(getConsumerCtx("stat"), &StatInterval{IntervalSeconds: 2})
+   wait(1)
+   statStream2, err := adm.Statistics(getConsumerCtx("stat"), &StatInterval{IntervalSeconds: 3})
 
 	mu := &sync.Mutex{}
 	stat1 := &Stat{}
