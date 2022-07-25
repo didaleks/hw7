@@ -12,6 +12,7 @@ import (
    "google.golang.org/grpc"
    "google.golang.org/grpc/codes"
    "google.golang.org/grpc/metadata"
+   "google.golang.org/grpc/peer"
    "google.golang.org/grpc/status"
 )
 
@@ -21,7 +22,11 @@ import (
 //    // запуск сервиса
 //    address := "127.0.0.1:8082"
 //    ctx := context.Background()
-//    StartMyMicroservice(ctx, address, "")
+//    err := StartMyMicroservice(ctx, address, ACLData)
+//    if err != nil {
+//       log.Fatal(err)
+//       return
+//    }
 //    fmt.Scanln()
 // }
 
@@ -34,11 +39,11 @@ type Middleware struct {
    AclData []ACLDataStruct
 }
 
-func (m Middleware) aclInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+func (m Middleware) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
    fullMethod := info.FullMethod
    h, _ := handler(ctx, req)
    consumer, err := GetConsumer(ctx)
-   fmt.Println("aclInterceptor method", fullMethod)
+   fmt.Println("interceptor method", fullMethod)
    fmt.Println(fullMethod, consumer)
    if err != nil {
       return h, status.Error(codes.Unauthenticated, err.Error())
@@ -55,11 +60,29 @@ func (m Middleware) aclInterceptor(ctx context.Context, req interface{}, info *g
    return h, err
 }
 
-func StartMyMicroservice(ctx context.Context, address string, aclDataJson string) error {
+func (m Middleware) streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+   fullMethod := info.FullMethod
+   consumer, err := GetConsumer(ss.Context())
+   handler(srv, ss)
+   fmt.Println(fullMethod, consumer)
+   if err != nil {
+      return status.Error(codes.Unauthenticated, err.Error())
+   }
+   allowed, err := IsAllowedMethod(consumer, fullMethod, m.AclData)
+   if err != nil {
+      return status.Error(codes.Unauthenticated, err.Error())
+   }
+   if !allowed {
+      return status.Error(codes.Unauthenticated, "disallowed method")
+   }
+   return nil
+}
+
+func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
    var aclDataMap map[string][]string
    err := json.Unmarshal([]byte(aclDataJson), &aclDataMap)
    if err != nil {
-      return err
+      return nil, err
    }
 
    var aclData []ACLDataStruct
@@ -70,6 +93,14 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
       aclData = append(aclData, ACLDataStruct{Consumer: consumer, Methods: aclDatum})
    }
 
+   return aclData, nil
+}
+
+func StartMyMicroservice(ctx context.Context, address string, aclDataJson string) error {
+   aclData, err := parseAcl(aclDataJson)
+   if err != nil {
+      return err
+   }
    middleware := Middleware{AclData: aclData}
    listener, err := net.Listen("tcp", address)
    if err != nil {
@@ -78,10 +109,17 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    }
 
    server := grpc.NewServer(
-      grpc.UnaryInterceptor(middleware.aclInterceptor),
+      grpc.UnaryInterceptor(middleware.interceptor),
+      grpc.StreamInterceptor(middleware.streamInterceptor),
    )
-   RegisterAdminServer(server, NewAdminService())
-   RegisterBizServer(server, NewBizService())
+   logsChan := make(chan Event, 10)
+
+   service := Service{logChan: logsChan}
+   admin := NewAdminService(service)
+   biz := NewBizService(service)
+
+   RegisterAdminServer(server, admin)
+   RegisterBizServer(server, biz)
    go func() {
       server.Serve(listener)
    }()
@@ -95,8 +133,16 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    return err
 }
 
+type Service struct {
+   logChan chan Event
+}
+
 type Admin struct {
-   ACLData []ACLDataStruct
+   Service Service
+}
+
+type Biz struct {
+   Service Service
 }
 
 func IsAllowedMethod(consumer string, inMethod string, rules []ACLDataStruct) (bool, error) {
@@ -133,38 +179,78 @@ func IsAllowedMethod(consumer string, inMethod string, rules []ACLDataStruct) (b
    return false, nil
 }
 
-func NewAdminService() AdminServer {
-   return &Admin{}
+func NewAdminService(service Service) AdminServer {
+   return &Admin{
+      Service: service,
+   }
 }
 
-func (admin Admin) Logging(in *Nothing, logServer Admin_LoggingServer) error {
-   return nil
+func newEvent(method string, ctx context.Context) Event {
+   p, _ := peer.FromContext(ctx)
+   addr := p.Addr.String()
+   consumer, _ := GetConsumer(ctx)
+   return Event{
+      Consumer: consumer,
+      Method:   method,
+      Host:     addr,
+   }
 }
 
-func (admin Admin) Statistics(stat *StatInterval, statServer Admin_StatisticsServer) error {
+func (admin Admin) Logging(in *Nothing, stream Admin_LoggingServer) error {
+   go func() {
+      for logMsg := range admin.Service.logChan {
+         fmt.Println("logMsg", logMsg)
+         err := stream.Send(&logMsg)
+         if err != nil {
+            log.Fatal(err)
+            return
+         }
+      }
+   }()
+   ctx := stream.Context()
+   event := newEvent("/main.Admin/Logging", ctx)
+   admin.Service.logChan <- event
+
+   for {
+      select {
+      case <-ctx.Done():
+         log.Printf("Client has disconnected")
+         return nil
+      }
+   }
+}
+
+func (admin Admin) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
+   // consumer, _ := GetConsumer(stream.Context())
+   log.Default().Println("Statistics method")
+   out := &Stat{}
+   stream.Send(out)
    return nil
 }
 
 func (admin Admin) mustEmbedUnimplementedAdminServer() {}
 
-type Biz struct {
-}
-
-func NewBizService() BizServer {
-   return &Biz{}
+func NewBizService(service Service) BizServer {
+   return &Biz{
+      Service: service,
+   }
 }
 
 func (biz Biz) Check(ctx context.Context, in *Nothing) (*Nothing, error) {
-   log.Default().Println("Check")
+   event := newEvent("/main.Biz/Check", ctx)
+   biz.Service.logChan <- event
    return in, nil
 }
 
 func (biz Biz) Add(ctx context.Context, in *Nothing) (*Nothing, error) {
-   log.Default().Println("Add")
+   event := newEvent("/main.Biz/Add", ctx)
+   biz.Service.logChan <- event
    return in, nil
 }
 
 func (biz Biz) Test(ctx context.Context, in *Nothing) (*Nothing, error) {
+   event := newEvent("/main.Biz/Test", ctx)
+   biz.Service.logChan <- event
    return in, nil
 }
 
