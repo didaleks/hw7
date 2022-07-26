@@ -37,7 +37,13 @@ type ACLDataStruct struct {
 
 type CoreService struct {
    AclData []ACLDataStruct
-   logChan chan Event
+   // logChans []chan Event
+   logChan   chan Event
+   listeners []listener
+}
+
+type listener struct {
+   stream Admin_LoggingServer
 }
 
 func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
@@ -58,6 +64,7 @@ func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grp
       return h, status.Error(codes.Unauthenticated, "disallowed method")
    }
 
+   // s.logChan <- newEvent(fullMethod, ctx)
    return h, err
 }
 
@@ -76,6 +83,11 @@ func (s CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, in
    if !allowed {
       return status.Error(codes.Unauthenticated, "disallowed method")
    }
+
+   if fullMethod == "/main.Admin/Logging" {
+
+   }
+
    return nil
 }
 
@@ -97,7 +109,7 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    )
    logsChan := make(chan Event, 10)
 
-   service := CoreService{logChan: logsChan}
+   service := &CoreService{logChan: logsChan}
    RegisterAdminServer(server, service)
    RegisterBizServer(server, service)
    go func() {
@@ -152,29 +164,37 @@ func newEvent(method string, ctx context.Context) Event {
    addr := p.Addr.String()
    consumer, _ := GetConsumer(ctx)
    return Event{
-      Consumer: consumer,
-      Method:   method,
-      Host:     addr,
+      Timestamp: 0,
+      Consumer:  consumer,
+      Method:    method,
+      Host:      addr,
    }
 }
 
-func (s CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
-   go func() {
-      for logMsg := range s.logChan {
-         fmt.Println("logMsg", logMsg)
-         err := stream.Send(&logMsg)
-         if err != nil {
-            log.Fatal(err)
-            return
-         }
+func (s *CoreService) sendToAllListeners(e *Event) {
+   for _, l := range s.listeners {
+      err := l.stream.Send(e)
+      // fmt.Println("EVENT", e)
+      if err != nil {
+         log.Fatal(err)
       }
-   }()
+   }
+}
+func (s *CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
+   // создать листенера и запомнить в нем стрим
+   // каждое сообщение рассылать всем листенерам
    ctx := stream.Context()
-   event := newEvent("/main.Admin/Logging", ctx)
-   s.logChan <- event
+   if len(s.listeners) == 0 {
+      s.logChan <- newEvent("/main.Admin/Logging", ctx)
+   }
+   s.addListener(listener{
+      stream: stream,
+   })
 
    for {
       select {
+      case logMsg := <-s.logChan:
+         s.sendToAllListeners(&logMsg)
       case <-ctx.Done():
          log.Printf("Client has disconnected")
          return nil
@@ -239,4 +259,8 @@ func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
    }
 
    return aclData, nil
+}
+
+func (s *CoreService) addListener(l listener) {
+   s.listeners = append(s.listeners, l)
 }
