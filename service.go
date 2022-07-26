@@ -8,6 +8,7 @@ import (
    "log"
    "net"
    "strings"
+   "sync"
 
    "google.golang.org/grpc"
    "google.golang.org/grpc/codes"
@@ -36,8 +37,8 @@ type ACLDataStruct struct {
 }
 
 type CoreService struct {
-   AclData []ACLDataStruct
-   // logChans []chan Event
+   m         *sync.Mutex
+   AclData   []ACLDataStruct
    logChan   chan Event
    listeners []listener
 }
@@ -84,10 +85,6 @@ func (s CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, in
       return status.Error(codes.Unauthenticated, "disallowed method")
    }
 
-   if fullMethod == "/main.Admin/Logging" {
-
-   }
-
    return nil
 }
 
@@ -96,7 +93,12 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    if err != nil {
       return err
    }
-   middleware := CoreService{AclData: aclData}
+   logsChan := make(chan Event, 10)
+   coreService := &CoreService{
+      m:       &sync.Mutex{},
+      AclData: aclData,
+      logChan: logsChan,
+   }
    listener, err := net.Listen("tcp", address)
    if err != nil {
       log.Fatalln("can't listen port", err)
@@ -104,14 +106,12 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    }
 
    server := grpc.NewServer(
-      grpc.UnaryInterceptor(middleware.interceptor),
-      grpc.StreamInterceptor(middleware.streamInterceptor),
+      grpc.UnaryInterceptor(coreService.interceptor),
+      grpc.StreamInterceptor(coreService.streamInterceptor),
    )
-   logsChan := make(chan Event, 10)
 
-   service := &CoreService{logChan: logsChan}
-   RegisterAdminServer(server, service)
-   RegisterBizServer(server, service)
+   RegisterAdminServer(server, coreService)
+   RegisterBizServer(server, coreService)
    go func() {
       server.Serve(listener)
    }()
@@ -172,17 +172,16 @@ func newEvent(method string, ctx context.Context) Event {
 }
 
 func (s *CoreService) sendToAllListeners(e *Event) {
+   s.m.Lock()
+   defer s.m.Unlock()
    for _, l := range s.listeners {
       err := l.stream.Send(e)
-      // fmt.Println("EVENT", e)
       if err != nil {
          log.Fatal(err)
       }
    }
 }
 func (s *CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
-   // создать листенера и запомнить в нем стрим
-   // каждое сообщение рассылать всем листенерам
    ctx := stream.Context()
    if len(s.listeners) == 0 {
       s.logChan <- newEvent("/main.Admin/Logging", ctx)
@@ -203,7 +202,6 @@ func (s *CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
 }
 
 func (s CoreService) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
-   // consumer, _ := GetConsumer(stream.Context())
    log.Default().Println("Statistics method")
    out := &Stat{}
    stream.Send(out)
@@ -262,5 +260,7 @@ func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
 }
 
 func (s *CoreService) addListener(l listener) {
+   s.m.Lock()
+   defer s.m.Unlock()
    s.listeners = append(s.listeners, l)
 }
