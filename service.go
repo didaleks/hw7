@@ -35,11 +35,12 @@ type ACLDataStruct struct {
    Methods  []string
 }
 
-type Middleware struct {
+type CoreService struct {
    AclData []ACLDataStruct
+   logChan chan Event
 }
 
-func (m Middleware) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
    fullMethod := info.FullMethod
    h, _ := handler(ctx, req)
    consumer, err := GetConsumer(ctx)
@@ -49,7 +50,7 @@ func (m Middleware) interceptor(ctx context.Context, req interface{}, info *grpc
       return h, status.Error(codes.Unauthenticated, err.Error())
    }
 
-   allowed, err := IsAllowedMethod(consumer, fullMethod, m.AclData)
+   allowed, err := IsAllowedMethod(consumer, fullMethod, s.AclData)
    if err != nil {
       return h, status.Error(codes.Unauthenticated, err.Error())
    }
@@ -60,7 +61,7 @@ func (m Middleware) interceptor(ctx context.Context, req interface{}, info *grpc
    return h, err
 }
 
-func (m Middleware) streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func (s CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
    fullMethod := info.FullMethod
    consumer, err := GetConsumer(ss.Context())
    handler(srv, ss)
@@ -68,7 +69,7 @@ func (m Middleware) streamInterceptor(srv interface{}, ss grpc.ServerStream, inf
    if err != nil {
       return status.Error(codes.Unauthenticated, err.Error())
    }
-   allowed, err := IsAllowedMethod(consumer, fullMethod, m.AclData)
+   allowed, err := IsAllowedMethod(consumer, fullMethod, s.AclData)
    if err != nil {
       return status.Error(codes.Unauthenticated, err.Error())
    }
@@ -78,30 +79,12 @@ func (m Middleware) streamInterceptor(srv interface{}, ss grpc.ServerStream, inf
    return nil
 }
 
-func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
-   var aclDataMap map[string][]string
-   err := json.Unmarshal([]byte(aclDataJson), &aclDataMap)
-   if err != nil {
-      return nil, err
-   }
-
-   var aclData []ACLDataStruct
-   for consumer, aclDatum := range aclDataMap {
-      for i, method := range aclDatum {
-         aclDatum[i] = method
-      }
-      aclData = append(aclData, ACLDataStruct{Consumer: consumer, Methods: aclDatum})
-   }
-
-   return aclData, nil
-}
-
 func StartMyMicroservice(ctx context.Context, address string, aclDataJson string) error {
    aclData, err := parseAcl(aclDataJson)
    if err != nil {
       return err
    }
-   middleware := Middleware{AclData: aclData}
+   middleware := CoreService{AclData: aclData}
    listener, err := net.Listen("tcp", address)
    if err != nil {
       log.Fatalln("can't listen port", err)
@@ -114,12 +97,9 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    )
    logsChan := make(chan Event, 10)
 
-   service := Service{logChan: logsChan}
-   admin := NewAdminService(service)
-   biz := NewBizService(service)
-
-   RegisterAdminServer(server, admin)
-   RegisterBizServer(server, biz)
+   service := CoreService{logChan: logsChan}
+   RegisterAdminServer(server, service)
+   RegisterBizServer(server, service)
    go func() {
       server.Serve(listener)
    }()
@@ -131,18 +111,6 @@ func StartMyMicroservice(ctx context.Context, address string, aclDataJson string
    }(ctx, server)
 
    return err
-}
-
-type Service struct {
-   logChan chan Event
-}
-
-type Admin struct {
-   Service Service
-}
-
-type Biz struct {
-   Service Service
 }
 
 func IsAllowedMethod(consumer string, inMethod string, rules []ACLDataStruct) (bool, error) {
@@ -179,12 +147,6 @@ func IsAllowedMethod(consumer string, inMethod string, rules []ACLDataStruct) (b
    return false, nil
 }
 
-func NewAdminService(service Service) AdminServer {
-   return &Admin{
-      Service: service,
-   }
-}
-
 func newEvent(method string, ctx context.Context) Event {
    p, _ := peer.FromContext(ctx)
    addr := p.Addr.String()
@@ -196,9 +158,9 @@ func newEvent(method string, ctx context.Context) Event {
    }
 }
 
-func (admin Admin) Logging(in *Nothing, stream Admin_LoggingServer) error {
+func (s CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
    go func() {
-      for logMsg := range admin.Service.logChan {
+      for logMsg := range s.logChan {
          fmt.Println("logMsg", logMsg)
          err := stream.Send(&logMsg)
          if err != nil {
@@ -209,7 +171,7 @@ func (admin Admin) Logging(in *Nothing, stream Admin_LoggingServer) error {
    }()
    ctx := stream.Context()
    event := newEvent("/main.Admin/Logging", ctx)
-   admin.Service.logChan <- event
+   s.logChan <- event
 
    for {
       select {
@@ -220,7 +182,7 @@ func (admin Admin) Logging(in *Nothing, stream Admin_LoggingServer) error {
    }
 }
 
-func (admin Admin) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
+func (s CoreService) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
    // consumer, _ := GetConsumer(stream.Context())
    log.Default().Println("Statistics method")
    out := &Stat{}
@@ -228,33 +190,27 @@ func (admin Admin) Statistics(stat *StatInterval, stream Admin_StatisticsServer)
    return nil
 }
 
-func (admin Admin) mustEmbedUnimplementedAdminServer() {}
+func (s CoreService) mustEmbedUnimplementedAdminServer() {}
 
-func NewBizService(service Service) BizServer {
-   return &Biz{
-      Service: service,
-   }
-}
-
-func (biz Biz) Check(ctx context.Context, in *Nothing) (*Nothing, error) {
+func (s CoreService) Check(ctx context.Context, in *Nothing) (*Nothing, error) {
    event := newEvent("/main.Biz/Check", ctx)
-   biz.Service.logChan <- event
+   s.logChan <- event
    return in, nil
 }
 
-func (biz Biz) Add(ctx context.Context, in *Nothing) (*Nothing, error) {
+func (s CoreService) Add(ctx context.Context, in *Nothing) (*Nothing, error) {
    event := newEvent("/main.Biz/Add", ctx)
-   biz.Service.logChan <- event
+   s.logChan <- event
    return in, nil
 }
 
-func (biz Biz) Test(ctx context.Context, in *Nothing) (*Nothing, error) {
+func (s CoreService) Test(ctx context.Context, in *Nothing) (*Nothing, error) {
    event := newEvent("/main.Biz/Test", ctx)
-   biz.Service.logChan <- event
+   s.logChan <- event
    return in, nil
 }
 
-func (biz Biz) mustEmbedUnimplementedBizServer() {
+func (s CoreService) mustEmbedUnimplementedBizServer() {
    log.Default().Println("mustEmbedUnimplementedBizServer")
 }
 
@@ -265,4 +221,22 @@ func GetConsumer(ctx context.Context) (string, error) {
    }
 
    return "", errors.New("no consumer data")
+}
+
+func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
+   var aclDataMap map[string][]string
+   err := json.Unmarshal([]byte(aclDataJson), &aclDataMap)
+   if err != nil {
+      return nil, err
+   }
+
+   var aclData []ACLDataStruct
+   for consumer, aclDatum := range aclDataMap {
+      for i, method := range aclDatum {
+         aclDatum[i] = method
+      }
+      aclData = append(aclData, ACLDataStruct{Consumer: consumer, Methods: aclDatum})
+   }
+
+   return aclData, nil
 }
