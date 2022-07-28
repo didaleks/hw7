@@ -65,7 +65,7 @@ func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grp
       return h, status.Error(codes.Unauthenticated, "disallowed method")
    }
 
-   // s.logChan <- newEvent(fullMethod, ctx)
+   s.logChan <- newEvent(fullMethod, ctx)
    return h, err
 }
 
@@ -211,20 +211,14 @@ func (s CoreService) Statistics(stat *StatInterval, stream Admin_StatisticsServe
 func (s CoreService) mustEmbedUnimplementedAdminServer() {}
 
 func (s CoreService) Check(ctx context.Context, in *Nothing) (*Nothing, error) {
-   event := newEvent("/main.Biz/Check", ctx)
-   s.logChan <- event
    return in, nil
 }
 
 func (s CoreService) Add(ctx context.Context, in *Nothing) (*Nothing, error) {
-   event := newEvent("/main.Biz/Add", ctx)
-   s.logChan <- event
    return in, nil
 }
 
 func (s CoreService) Test(ctx context.Context, in *Nothing) (*Nothing, error) {
-   event := newEvent("/main.Biz/Test", ctx)
-   s.logChan <- event
    return in, nil
 }
 
