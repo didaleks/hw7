@@ -9,6 +9,7 @@ import (
    "net"
    "strings"
    "sync"
+   "time"
 
    "google.golang.org/grpc"
    "google.golang.org/grpc/codes"
@@ -37,26 +38,51 @@ type ACLDataStruct struct {
 }
 
 type CoreService struct {
-   m         *sync.Mutex
-   AclData   []ACLDataStruct
-   logChan   chan Event
-   listeners []listener
+   m             *sync.Mutex
+   AclData       []ACLDataStruct
+   logChan       chan Event
+   logListeners  []*logListener
+   statListeners []*statListener
 }
 
-type listener struct {
+type logListener struct {
    stream Admin_LoggingServer
 }
 
-func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+type statListener struct {
+   m                     *sync.RWMutex
+   stream                *Admin_StatisticsServer
+   statMethodsCounters   map[string]uint64
+   statConsumersCounters map[string]uint64
+}
+
+func (s *CoreService) sendStatToListeners(method string, consumer string) {
+   s.m.Lock()
+   for _, listener := range s.statListeners {
+      _, ok := listener.statMethodsCounters[method]
+      if ok {
+         listener.statMethodsCounters[method]++
+      } else {
+         listener.statMethodsCounters[method] = 1
+      }
+
+      _, ok = listener.statConsumersCounters[consumer]
+      if ok {
+         listener.statConsumersCounters[consumer]++
+      } else {
+         listener.statConsumersCounters[consumer] = 1
+      }
+   }
+   s.m.Unlock()
+}
+
+func (s *CoreService) interceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
    fullMethod := info.FullMethod
    h, _ := handler(ctx, req)
    consumer, err := GetConsumer(ctx)
-   fmt.Println("interceptor method", fullMethod)
-   fmt.Println(fullMethod, consumer)
    if err != nil {
       return h, status.Error(codes.Unauthenticated, err.Error())
    }
-
    allowed, err := IsAllowedMethod(consumer, fullMethod, s.AclData)
    if err != nil {
       return h, status.Error(codes.Unauthenticated, err.Error())
@@ -66,13 +92,15 @@ func (s CoreService) interceptor(ctx context.Context, req interface{}, info *grp
    }
 
    s.logChan <- newEvent(fullMethod, ctx)
+
+   s.sendStatToListeners(fullMethod, consumer)
    return h, err
 }
 
-func (s CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+func (s *CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
    fullMethod := info.FullMethod
    consumer, err := GetConsumer(ss.Context())
-   handler(srv, ss)
+
    fmt.Println(fullMethod, consumer)
    if err != nil {
       return status.Error(codes.Unauthenticated, err.Error())
@@ -85,6 +113,8 @@ func (s CoreService) streamInterceptor(srv interface{}, ss grpc.ServerStream, in
       return status.Error(codes.Unauthenticated, "disallowed method")
    }
 
+   _ = handler(srv, ss)
+   s.sendStatToListeners(fullMethod, consumer)
    return nil
 }
 
@@ -171,29 +201,33 @@ func newEvent(method string, ctx context.Context) Event {
    }
 }
 
-func (s *CoreService) sendToAllListeners(e *Event) {
-   s.m.Lock()
-   defer s.m.Unlock()
-   for _, l := range s.listeners {
+func (s *CoreService) sendLogToAllListeners(e *Event) {
+   // s.m.Lock()
+   // defer s.m.Unlock()
+   for _, l := range s.logListeners {
       err := l.stream.Send(e)
       if err != nil {
          log.Fatal(err)
       }
    }
 }
+
 func (s *CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
    ctx := stream.Context()
-   if len(s.listeners) == 0 {
+   s.m.Lock()
+   lenListeners := len(s.logListeners)
+   s.m.Unlock()
+   if lenListeners == 0 {
       s.logChan <- newEvent("/main.Admin/Logging", ctx)
    }
-   s.addListener(listener{
+   s.addLogListener(&logListener{
       stream: stream,
    })
 
    for {
       select {
       case logMsg := <-s.logChan:
-         s.sendToAllListeners(&logMsg)
+         s.sendLogToAllListeners(&logMsg)
       case <-ctx.Done():
          log.Printf("Client has disconnected")
          return nil
@@ -201,11 +235,46 @@ func (s *CoreService) Logging(in *Nothing, stream Admin_LoggingServer) error {
    }
 }
 
-func (s CoreService) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
-   log.Default().Println("Statistics method")
-   out := &Stat{}
-   stream.Send(out)
-   return nil
+func (s *CoreService) Statistics(stat *StatInterval, stream Admin_StatisticsServer) error {
+   l := &statListener{
+      m:                     &sync.RWMutex{},
+      stream:                &stream,
+      statMethodsCounters:   make(map[string]uint64),
+      statConsumersCounters: make(map[string]uint64),
+   }
+   s.m.Lock()
+   if len(s.statListeners) == 0 {
+      l.statMethodsCounters = map[string]uint64{
+         "/main.Admin/Statistics": 1,
+      }
+      consumer, _ := GetConsumer(stream.Context())
+      l.statConsumersCounters = map[string]uint64{
+         consumer: 1,
+      }
+   }
+   s.m.Unlock()
+   s.addStatListener(l)
+
+   seconds := int64(stat.IntervalSeconds)
+   ticker := time.NewTicker(time.Duration(seconds) * time.Second)
+   for {
+      select {
+      case <-ticker.C:
+         out := &Stat{
+            Timestamp:  0,
+            ByMethod:   l.statMethodsCounters,
+            ByConsumer: l.statConsumersCounters,
+         }
+         _ = stream.Send(out)
+         s.m.Lock()
+         l.statMethodsCounters = make(map[string]uint64)
+         l.statConsumersCounters = make(map[string]uint64)
+         s.m.Unlock()
+      case <-stream.Context().Done():
+         ticker.Stop()
+         return nil
+      }
+   }
 }
 
 func (s CoreService) mustEmbedUnimplementedAdminServer() {}
@@ -253,8 +322,14 @@ func parseAcl(aclDataJson string) ([]ACLDataStruct, error) {
    return aclData, nil
 }
 
-func (s *CoreService) addListener(l listener) {
+func (s *CoreService) addStatListener(l *statListener) {
    s.m.Lock()
    defer s.m.Unlock()
-   s.listeners = append(s.listeners, l)
+   s.statListeners = append(s.statListeners, l)
+}
+
+func (s *CoreService) addLogListener(l *logListener) {
+   s.m.Lock()
+   defer s.m.Unlock()
+   s.logListeners = append(s.logListeners, l)
 }
